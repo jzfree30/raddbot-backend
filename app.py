@@ -1,13 +1,17 @@
 import os
 import re
+import glob
 import subprocess
-from flask import Flask, request, jsonify
+import requests
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-RUSTCOIN_PATH = os.path.join(os.path.dirname(__file__), "rustcoin")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RUSTCOIN_PATH = os.path.join(BASE_DIR, "rustcoin")
+PACKS_DIR = os.path.join(BASE_DIR, "packs")
 
 def ensure_executable():
     if os.path.exists(RUSTCOIN_PATH):
@@ -17,9 +21,25 @@ def clean_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
+def upload_to_pixeldrain(file_path):
+    """Sube el archivo descargado a Pixeldrain para dar un link directo de descarga."""
+    try:
+        with open(file_path, 'rb') as f:
+            response = requests.post(
+                'https://pixeldrain.com/api/file',
+                files={'file': f}
+            )
+        data = response.json()
+        if data.get('success'):
+            file_id = data.get('id')
+            return f"https://pixeldrain.com/api/file/{file_id}?download"
+    except Exception as e:
+        print(f"Error subiendo archivo: {e}")
+    return None
+
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({"status": "RADDCRAFT Backend Direct Link Active", "executable_exists": os.path.exists(RUSTCOIN_PATH)})
+    return jsonify({"status": "RADDCRAFT Backend Active", "executable_exists": os.path.exists(RUSTCOIN_PATH)})
 
 @app.route('/api/search', methods=['POST'])
 def search():
@@ -58,33 +78,58 @@ def get_link():
     option = request.args.get('option', '1')
 
     if not query:
-        return jsonify({"error": "Falta el parámetro query"}), 400
+        return jsonify({"error": "Falta la búsqueda"}), 400
 
     try:
+        # 1. Asegurar carpeta packs
+        os.makedirs(PACKS_DIR, exist_ok=True)
+        
+        # Registrar archivos existentes antes de la descarga
+        files_before = set(os.listdir(PACKS_DIR))
+
+        # 2. Ejecutar rustcoin simulando la entrada exacta de Termux:
+        # Búsqueda -> 'd' (download) -> número de opción -> 'q' (quit)
+        input_commands = f"{query}\nd\n{option}\nq\n"
+        
         process = subprocess.Popen(
             [RUSTCOIN_PATH],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            cwd=BASE_DIR,
             text=True
         )
         
-        # Enviar comandos a rustcoin para obtener la URL
-        stdout, _ = process.communicate(input=f"{query}\no\n{option}\nq\n", timeout=40)
-        clean_output = clean_ansi(stdout)
+        stdout, stderr = process.communicate(input=input_commands, timeout=90)
 
-        # Buscar enlaces web que comiencen por http/https
-        urls = re.findall(r'https?://[^\s>"]+', clean_output)
+        # 3. Detectar el nuevo archivo descargado en 'packs'
+        files_after = set(os.listdir(PACKS_DIR))
+        new_files = list(files_after - files_before)
 
-        if urls:
-            url_encontrada = urls[0]
-            # Si el enlace no empieza con http:// ni https://, añadir la cabecera
-            if not url_encontrada.startswith(('http://', 'https://')):
-                url_encontrada = 'https://' + url_encontrada
-            
-            return jsonify({"success": True, "download_url": url_encontrada})
+        download_file = None
+        if new_files:
+            download_file = os.path.join(PACKS_DIR, new_files[0])
         else:
-            return jsonify({"error": "No se pudo extraer el enlace directo"}), 404
+            # Si no se detectó por diferencia, buscar el más reciente en packs
+            all_files = [os.path.join(PACKS_DIR, f) for f in os.listdir(PACKS_DIR) if os.path.isfile(os.path.join(PACKS_DIR, f))]
+            if all_files:
+                download_file = max(all_files, key=os.path.getmtime)
+
+        if download_file and os.path.exists(download_file):
+            # 4. Subir a la nube para generar link directo
+            download_url = upload_to_pixeldrain(download_file)
+            
+            # Limpiar el archivo local para no llenar el disco del servidor
+            try:
+                os.remove(download_file)
+            except:
+                pass
+
+            if download_url:
+                return jsonify({"success": True, "download_url": download_url})
+
+        return jsonify({"error": "No se pudo procesar la descarga del archivo"}), 500
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
