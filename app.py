@@ -30,7 +30,6 @@ def search():
         return jsonify({"error": "No query provided"}), 400
 
     try:
-        # Enviar la consulta a la entrada interactiva (stdin) de rustcoin
         process = subprocess.Popen(
             [RUSTCOIN_PATH],
             stdin=subprocess.PIPE,
@@ -39,16 +38,16 @@ def search():
             text=True
         )
         
-        stdout, _ = process.communicate(input=f"{query}\n", timeout=30)
+        # Enviar consulta e inmediatamente salir con q para cerrar el proceso
+        stdout, _ = process.communicate(input=f"{query}\nq\n", timeout=30)
         clean_output = clean_ansi(stdout)
         
         lines = []
         for line in clean_output.split('\n'):
             line = line.strip()
-            # Omitir textos de la interfaz inicial del ejecutable
-            if not line or "Keys updated" in line or "help" in line or "Search" in line or "RUSTCOIN" in line or "PlayFab" in line:
-                continue
-            lines.append(line)
+            # Capturar únicamente las líneas de resultados numerados (ej: "1. The Bloop Add-On...")
+            if line and re.match(r'^\d+\.', line):
+                lines.append(line)
             
         return jsonify({"results": lines})
     except Exception as e:
@@ -64,9 +63,7 @@ def download():
         return "Falta el parámetro query", 400
 
     try:
-        before_files = set(os.listdir('.'))
-        
-        # Simular la secuencia interactiva: enviar búsqueda -> enviar número de opción
+        # Recrear el flujo exacto de Termux: Búsqueda -> "d" (Download) -> Selección (ej: 1)
         process = subprocess.Popen(
             [RUSTCOIN_PATH],
             stdin=subprocess.PIPE,
@@ -75,21 +72,24 @@ def download():
             text=True
         )
         
-        process.communicate(input=f"{query}\n{option}\n", timeout=60)
+        # Envía: búsqueda -> d -> número de opción
+        process.communicate(input=f"{query}\nd\n{option}\nq\n", timeout=60)
 
-        after_files = set(os.listdir('.'))
-        new_files = list(after_files - before_files)
+        # Buscar en la carpeta raíz y en la subcarpeta 'packs'
+        target_dirs = ['.', 'packs']
+        found_files = []
 
-        # Filtrar el archivo descargado omitiendo temporales o configs como keys.tsv
-        valid_files = [f for f in new_files if not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) and f != 'rustcoin']
+        for d in target_dirs:
+            if os.path.exists(d):
+                files = [os.path.join(d, f) for f in os.listdir(d) 
+                         if os.path.isfile(os.path.join(d, f)) 
+                         and not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) 
+                         and f != 'rustcoin']
+                found_files.extend(files)
 
-        if not valid_files:
-            all_files = [f for f in os.listdir('.') if os.path.isfile(f) and not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) and f != 'rustcoin']
-            if all_files:
-                valid_files = [max(all_files, key=os.path.getmtime)]
-
-        if valid_files:
-            return send_file(valid_files[0], as_attachment=True)
+        if found_files:
+            latest_file = max(found_files, key=os.path.getmtime)
+            return send_file(latest_file, as_attachment=True)
         else:
             return "El archivo no se encontró o no se pudo generar.", 404
     except Exception as e:
