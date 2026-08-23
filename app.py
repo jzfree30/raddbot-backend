@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -6,13 +7,16 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 
-# Ruta absoluta al ejecutable rustcoin
 RUSTCOIN_PATH = os.path.join(os.path.dirname(__file__), "rustcoin")
 
 def ensure_executable():
-    """Asegura que el ejecutable rustcoin tenga permisos +x"""
     if os.path.exists(RUSTCOIN_PATH):
         os.chmod(RUSTCOIN_PATH, 0o755)
+
+def clean_ansi(text):
+    """Limpia secuencias de escape ANSI (colores y códigos de terminal)"""
+    ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    return ansi_escape.sub('', text)
 
 @app.route('/', methods=['GET'])
 def index():
@@ -27,10 +31,20 @@ def search():
         return jsonify({"error": "No query provided"}), 400
 
     try:
-        # Ejecuta rustcoin pasándole la consulta
         result = subprocess.run([RUSTCOIN_PATH, query], capture_output=True, text=True, timeout=30)
-        output = result.stdout.strip()
-        lines = [line.strip() for line in output.split('\n') if line.strip()]
+        raw_output = result.stdout
+        
+        # Limpiar colores ANSI
+        clean_output = clean_ansi(raw_output)
+        
+        lines = []
+        for line in clean_output.split('\n'):
+            line = line.strip()
+            # Omitir líneas vacías, mensajes de login o banners de RUSTCOIN
+            if not line or "RUSTCOIN" in line or "PlayFab" in line or "v1.0" in line or "2J" in line:
+                continue
+            lines.append(line)
+            
         return jsonify({"results": lines})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -45,16 +59,27 @@ def download():
         return "Falta el parámetro query", 400
 
     try:
-        # Ejecuta rustcoin para procesar la opción de descarga
-        subprocess.run([RUSTCOIN_PATH, query, option], check=True, timeout=60)
+        # Guardar lista de archivos previos antes de ejecutar
+        before_files = set(os.listdir('.'))
+        
+        subprocess.run([RUSTCOIN_PATH, query, option], check=True, timeout=90)
 
-        # Busca el archivo descargado en el directorio actual
-        files = [f for f in os.listdir('.') if os.path.isfile(f) and not f.endswith(('.py', '.txt', '.md')) and f != 'rustcoin']
-        if files:
-            latest_file = max(files, key=os.path.getmtime)
-            return send_file(latest_file, as_attachment=True)
+        after_files = set(os.listdir('.'))
+        new_files = list(after_files - before_files)
+
+        # Filtrar solo archivos de contenido, ignorando configs o logs como keys.tsv
+        valid_files = [f for f in new_files if not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) and f != 'rustcoin']
+
+        if not valid_files:
+            # Si no hay nuevos en el diff, buscar los más recientes ignorando system files
+            all_files = [f for f in os.listdir('.') if os.path.isfile(f) and not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) and f != 'rustcoin']
+            if all_files:
+                valid_files = [max(all_files, key=os.path.getmtime)]
+
+        if valid_files:
+            return send_file(valid_files[0], as_attachment=True)
         else:
-            return "El archivo no se generó correctamente.", 404
+            return "El archivo no se encontró o no se pudo generar.", 404
     except Exception as e:
         return f"Error en la descarga: {str(e)}", 500
 
