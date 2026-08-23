@@ -14,7 +14,6 @@ def ensure_executable():
         os.chmod(RUSTCOIN_PATH, 0o755)
 
 def clean_ansi(text):
-    """Limpia secuencias de escape ANSI (colores y códigos de terminal)"""
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
@@ -31,17 +30,23 @@ def search():
         return jsonify({"error": "No query provided"}), 400
 
     try:
-        result = subprocess.run([RUSTCOIN_PATH, query], capture_output=True, text=True, timeout=30)
-        raw_output = result.stdout
+        # Enviar la consulta a la entrada interactiva (stdin) de rustcoin
+        process = subprocess.Popen(
+            [RUSTCOIN_PATH],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
         
-        # Limpiar colores ANSI
-        clean_output = clean_ansi(raw_output)
+        stdout, _ = process.communicate(input=f"{query}\n", timeout=30)
+        clean_output = clean_ansi(stdout)
         
         lines = []
         for line in clean_output.split('\n'):
             line = line.strip()
-            # Omitir líneas vacías, mensajes de login o banners de RUSTCOIN
-            if not line or "RUSTCOIN" in line or "PlayFab" in line or "v1.0" in line or "2J" in line:
+            # Omitir textos de la interfaz inicial del ejecutable
+            if not line or "Keys updated" in line or "help" in line or "Search" in line or "RUSTCOIN" in line or "PlayFab" in line:
                 continue
             lines.append(line)
             
@@ -59,19 +64,26 @@ def download():
         return "Falta el parámetro query", 400
 
     try:
-        # Guardar lista de archivos previos antes de ejecutar
         before_files = set(os.listdir('.'))
         
-        subprocess.run([RUSTCOIN_PATH, query, option], check=True, timeout=90)
+        # Simular la secuencia interactiva: enviar búsqueda -> enviar número de opción
+        process = subprocess.Popen(
+            [RUSTCOIN_PATH],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        process.communicate(input=f"{query}\n{option}\n", timeout=60)
 
         after_files = set(os.listdir('.'))
         new_files = list(after_files - before_files)
 
-        # Filtrar solo archivos de contenido, ignorando configs o logs como keys.tsv
+        # Filtrar el archivo descargado omitiendo temporales o configs como keys.tsv
         valid_files = [f for f in new_files if not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) and f != 'rustcoin']
 
         if not valid_files:
-            # Si no hay nuevos en el diff, buscar los más recientes ignorando system files
             all_files = [f for f in os.listdir('.') if os.path.isfile(f) and not f.endswith(('.py', '.txt', '.tsv', '.json', '.md')) and f != 'rustcoin']
             if all_files:
                 valid_files = [max(all_files, key=os.path.getmtime)]
