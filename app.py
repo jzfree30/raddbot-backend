@@ -1,8 +1,7 @@
 import os
 import re
-import glob
+import threading
 import subprocess
-import requests
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
@@ -13,6 +12,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUSTCOIN_PATH = os.path.join(BASE_DIR, "rustcoin")
 PACKS_DIR = os.path.join(BASE_DIR, "packs")
 
+# Diccionario para rastrear descargas activas
+tasks = {}
+
 def ensure_executable():
     if os.path.exists(RUSTCOIN_PATH):
         os.chmod(RUSTCOIN_PATH, 0o755)
@@ -21,25 +23,37 @@ def clean_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
-def upload_to_pixeldrain(file_path):
-    """Sube el archivo descargado a Pixeldrain para dar un link directo de descarga."""
+def run_download_task(task_id, query, option):
     try:
-        with open(file_path, 'rb') as f:
-            response = requests.post(
-                'https://pixeldrain.com/api/file',
-                files={'file': f}
-            )
-        data = response.json()
-        if data.get('success'):
-            file_id = data.get('id')
-            return f"https://pixeldrain.com/api/file/{file_id}?download"
-    except Exception as e:
-        print(f"Error subiendo archivo: {e}")
-    return None
+        os.makedirs(PACKS_DIR, exist_ok=True)
+        files_before = set(os.listdir(PACKS_DIR))
 
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({"status": "RADDCRAFT Backend Active", "executable_exists": os.path.exists(RUSTCOIN_PATH)})
+        input_commands = f"{query}\nd\n{option}\nq\n"
+        process = subprocess.Popen(
+            [RUSTCOIN_PATH],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=BASE_DIR,
+            text=True
+        )
+        process.communicate(input=input_commands, timeout=600)  # Hasta 10 minutos para mundos pesados
+
+        files_after = set(os.listdir(PACKS_DIR))
+        new_files = list(files_after - files_before)
+
+        if new_files:
+            filename = new_files[0]
+            tasks[task_id] = {"status": "completed", "file": filename}
+        else:
+            all_files = [f for f in os.listdir(PACKS_DIR) if os.path.isfile(os.path.join(PACKS_DIR, f))]
+            if all_files:
+                latest = max(all_files, key=lambda x: os.path.getmtime(os.path.join(PACKS_DIR, x)))
+                tasks[task_id] = {"status": "completed", "file": latest}
+            else:
+                tasks[task_id] = {"status": "error", "message": "No se generó el archivo."}
+    except Exception as e:
+        tasks[task_id] = {"status": "error", "message": str(e)}
 
 @app.route('/api/search', methods=['POST'])
 def search():
@@ -57,22 +71,16 @@ def search():
             stderr=subprocess.PIPE,
             text=True
         )
-        
         stdout, _ = process.communicate(input=f"{query}\nq\n", timeout=30)
         clean_output = clean_ansi(stdout)
         
-        lines = []
-        for line in clean_output.split('\n'):
-            line = line.strip()
-            if line and re.match(r'^\d+\.', line):
-                lines.append(line)
-            
+        lines = [l.strip() for l in clean_output.split('\n') if l.strip() and re.match(r'^\d+\.', l.strip())]
         return jsonify({"results": lines})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/get_link', methods=['GET'])
-def get_link():
+@app.route('/api/start_download', methods=['GET'])
+def start_download():
     ensure_executable()
     query = request.args.get('query', '')
     option = request.args.get('option', '1')
@@ -80,58 +88,31 @@ def get_link():
     if not query:
         return jsonify({"error": "Falta la búsqueda"}), 400
 
-    try:
-        # 1. Asegurar carpeta packs
-        os.makedirs(PACKS_DIR, exist_ok=True)
-        
-        # Registrar archivos existentes antes de la descarga
-        files_before = set(os.listdir(PACKS_DIR))
+    task_id = f"{hash(query)}_{option}"
+    tasks[task_id] = {"status": "downloading"}
 
-        # 2. Ejecutar rustcoin simulando la entrada exacta de Termux:
-        # Búsqueda -> 'd' (download) -> número de opción -> 'q' (quit)
-        input_commands = f"{query}\nd\n{option}\nq\n"
-        
-        process = subprocess.Popen(
-            [RUSTCOIN_PATH],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=BASE_DIR,
-            text=True
-        )
-        
-        stdout, stderr = process.communicate(input=input_commands, timeout=90)
+    thread = threading.Thread(target=run_download_task, args=(task_id, query, option))
+    thread.start()
 
-        # 3. Detectar el nuevo archivo descargado en 'packs'
-        files_after = set(os.listdir(PACKS_DIR))
-        new_files = list(files_after - files_before)
+    return jsonify({"success": True, "task_id": task_id})
 
-        download_file = None
-        if new_files:
-            download_file = os.path.join(PACKS_DIR, new_files[0])
-        else:
-            # Si no se detectó por diferencia, buscar el más reciente en packs
-            all_files = [os.path.join(PACKS_DIR, f) for f in os.listdir(PACKS_DIR) if os.path.isfile(os.path.join(PACKS_DIR, f))]
-            if all_files:
-                download_file = max(all_files, key=os.path.getmtime)
+@app.route('/api/check_status', methods=['GET'])
+def check_status():
+    task_id = request.args.get('task_id', '')
+    task = tasks.get(task_id)
 
-        if download_file and os.path.exists(download_file):
-            # 4. Subir a la nube para generar link directo
-            download_url = upload_to_pixeldrain(download_file)
-            
-            # Limpiar el archivo local para no llenar el disco del servidor
-            try:
-                os.remove(download_file)
-            except:
-                pass
+    if not task:
+        return jsonify({"status": "not_found"}), 404
 
-            if download_url:
-                return jsonify({"success": True, "download_url": download_url})
+    if task["status"] == "completed":
+        file_url = f"{request.host_url}files/packs/{task['file']}"
+        return jsonify({"status": "completed", "download_url": file_url})
 
-        return jsonify({"error": "No se pudo procesar la descarga del archivo"}), 500
+    return jsonify({"status": task["status"]})
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route('/files/packs/<path:filename>')
+def serve_pack(filename):
+    return send_from_directory(PACKS_DIR, filename, as_attachment=True)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
