@@ -61,7 +61,6 @@ def get_link():
         return jsonify({"error": "Falta el parámetro query"}), 400
 
     try:
-        # Enviar comandos: Búsqueda -> "o" (obtener enlace) -> número de opción
         process = subprocess.Popen(
             [RUSTCOIN_PATH],
             stdin=subprocess.PIPE,
@@ -70,15 +69,20 @@ def get_link():
             text=True
         )
         
+        # Enviar comandos a rustcoin para obtener la URL
         stdout, _ = process.communicate(input=f"{query}\no\n{option}\nq\n", timeout=40)
         clean_output = clean_ansi(stdout)
 
-        # Buscar cualquier patrón de URL en la salida de rustcoin
-        urls = re.findall(r'https?://[^\s]+', clean_output)
+        # Buscar enlaces web que comiencen por http/https
+        urls = re.findall(r'https?://[^\s>"]+', clean_output)
 
         if urls:
-            # Retorna el enlace extraído directamente al cliente
-            return jsonify({"success": True, "download_url": urls[0]})
+            url_encontrada = urls[0]
+            # Si el enlace no empieza con http:// ni https://, añadir la cabecera
+            if not url_encontrada.startswith(('http://', 'https://')):
+                url_encontrada = 'https://' + url_encontrada
+            
+            return jsonify({"success": True, "download_url": url_encontrada})
         else:
             return jsonify({"error": "No se pudo extraer el enlace directo"}), 404
     except Exception as e:
