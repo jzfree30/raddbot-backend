@@ -16,6 +16,11 @@ PACKS_DIR = os.path.join(BASE_DIR, "packs")
 
 tasks = {}
 
+# --- SISTEMA DE CONTROL DE TRÁFICO Y RAM ---
+download_lock = threading.Lock()
+is_downloading = False
+current_query = ""
+
 def ensure_executable():
     if os.path.exists(RUSTCOIN_PATH):
         os.chmod(RUSTCOIN_PATH, 0o755)
@@ -24,7 +29,7 @@ def clean_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
-def auto_delete_file(file_path, delay=420): # Borrado a los 7 minutos
+def auto_delete_file(file_path, delay=420):
     time.sleep(delay)
     try:
         if os.path.exists(file_path):
@@ -34,6 +39,7 @@ def auto_delete_file(file_path, delay=420): # Borrado a los 7 minutos
         print(f"Error en borrado automático: {e}")
 
 def run_download_task(task_id, query, option):
+    global is_downloading, current_query
     try:
         os.makedirs(PACKS_DIR, exist_ok=True)
         files_before = set(os.listdir(PACKS_DIR))
@@ -51,8 +57,6 @@ def run_download_task(task_id, query, option):
 
         files_after = set(os.listdir(PACKS_DIR))
         new_files = list(files_after - files_before)
-
-        # Filtrar solo archivos válidos generados
         created_files = [f for f in new_files if os.path.isfile(os.path.join(PACKS_DIR, f))]
 
         if not created_files:
@@ -61,7 +65,6 @@ def run_download_task(task_id, query, option):
 
         final_filename = None
 
-        # SI RUSTCOIN DESCARGÓ MÁS DE 1 ARCHIVO -> COMPRIMIR EN UN SOLO ZIP
         if len(created_files) > 1:
             clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', query)
             zip_filename = f"{clean_name}_completo.zip"
@@ -71,7 +74,6 @@ def run_download_task(task_id, query, option):
                 for file_name in created_files:
                     file_full_path = os.path.join(PACKS_DIR, file_name)
                     zipf.write(file_full_path, arcname=file_name)
-                    # Eliminar los sueltos para dejar solo el ZIP
                     try:
                         os.remove(file_full_path)
                     except Exception:
@@ -79,17 +81,20 @@ def run_download_task(task_id, query, option):
 
             final_filename = zip_filename
         else:
-            # Si solo fue 1 archivo (.mcpack, .mcworld, etc.), dejarlo como está
             final_filename = created_files[0]
 
         file_path = os.path.join(PACKS_DIR, final_filename)
         tasks[task_id] = {"status": "completed", "file": final_filename}
         
-        # Hilo de borrado por tiempo si no lo descargan
         threading.Thread(target=auto_delete_file, args=(file_path, 420), daemon=True).start()
 
     except Exception as e:
         tasks[task_id] = {"status": "error", "message": str(e)}
+    finally:
+        # Liberar el servidor cuando la descarga termine
+        with download_lock:
+            is_downloading = False
+            current_query = ""
 
 @app.route('/api/search', methods=['POST'])
 def search():
@@ -117,12 +122,26 @@ def search():
 
 @app.route('/api/start_download', methods=['GET'])
 def start_download():
+    global is_downloading, current_query
     ensure_executable()
     query = request.args.get('query', '')
     option = request.args.get('option', '1')
 
     if not query:
         return jsonify({"error": "Falta la búsqueda"}), 400
+
+    # REVISAR SI EL SERVIDOR ESTÁ OCUPADO
+    with download_lock:
+        if is_downloading:
+            return jsonify({
+                "success": False, 
+                "busy": True,
+                "message": f"⚠️ El servidor está procesando otro archivo ('{current_query}'). Por favor, espera 1 o 2 minutos y vuelve a intentarlo para no saturar el sistema."
+            })
+        
+        # Marcar servidor como ocupado
+        is_downloading = True
+        current_query = query
 
     task_id = f"{hash(query)}_{option}_{int(time.time())}"
     tasks[task_id] = {"status": "downloading"}
