@@ -15,8 +15,6 @@ RUSTCOIN_PATH = os.path.join(BASE_DIR, "rustcoin")
 PACKS_DIR = os.path.join(BASE_DIR, "packs")
 
 tasks = {}
-
-# --- SISTEMA DE CONTROL DE TRÁFICO Y RAM ---
 download_lock = threading.Lock()
 is_downloading = False
 current_query = ""
@@ -34,17 +32,19 @@ def auto_delete_file(file_path, delay=420):
     try:
         if os.path.exists(file_path):
             os.remove(file_path)
-            print(f"Archivo eliminado por tiempo límite: {file_path}")
     except Exception as e:
-        print(f"Error en borrado automático: {e}")
+        print(f"Error borrando archivo: {e}")
 
-def run_download_task(task_id, query, option):
+def run_download_task(task_id, query, option, page=1):
     global is_downloading, current_query
     try:
         os.makedirs(PACKS_DIR, exist_ok=True)
         files_before = set(os.listdir(PACKS_DIR))
 
-        input_commands = f"{query}\nd\n{option}\nq\n"
+        # Enviar saltos de página 'n' necesarios según la página actual
+        page_commands = "n\n" * (page - 1)
+        input_commands = f"{query}\n{page_commands}d\n{option}\nq\n"
+        
         process = subprocess.Popen(
             [RUSTCOIN_PATH],
             stdin=subprocess.PIPE,
@@ -63,11 +63,9 @@ def run_download_task(task_id, query, option):
             tasks[task_id] = {"status": "error", "message": "No se generó ningún archivo."}
             return
 
-        final_filename = None
-
         if len(created_files) > 1:
             clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', query)
-            zip_filename = f"{clean_name}_completo.zip"
+            zip_filename = f"{clean_name}_p{page}_completo.zip"
             zip_path = os.path.join(PACKS_DIR, zip_filename)
 
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -85,13 +83,11 @@ def run_download_task(task_id, query, option):
 
         file_path = os.path.join(PACKS_DIR, final_filename)
         tasks[task_id] = {"status": "completed", "file": final_filename}
-        
         threading.Thread(target=auto_delete_file, args=(file_path, 420), daemon=True).start()
 
     except Exception as e:
         tasks[task_id] = {"status": "error", "message": str(e)}
     finally:
-        # Liberar el servidor cuando la descarga termine
         with download_lock:
             is_downloading = False
             current_query = ""
@@ -101,10 +97,15 @@ def search():
     ensure_executable()
     data = request.get_json() or {}
     query = data.get('query', '')
+    page = int(data.get('page', 1))
+
     if not query:
         return jsonify({"error": "No query provided"}), 400
 
     try:
+        page_commands = "n\n" * (page - 1)
+        input_commands = f"{query}\n{page_commands}q\n"
+
         process = subprocess.Popen(
             [RUSTCOIN_PATH],
             stdin=subprocess.PIPE,
@@ -112,11 +113,19 @@ def search():
             stderr=subprocess.PIPE,
             text=True
         )
-        stdout, _ = process.communicate(input=f"{query}\nq\n", timeout=30)
+        stdout, _ = process.communicate(input=input_commands, timeout=30)
         clean_output = clean_ansi(stdout)
         
         lines = [l.strip() for l in clean_output.split('\n') if l.strip() and re.match(r'^\d+\.', l.strip())]
-        return jsonify({"results": lines})
+        
+        # Detectar si existe el comando [n]ext en la salida
+        has_next = "[n]ext" in clean_output
+        
+        return jsonify({
+            "results": lines,
+            "page": page,
+            "has_next": has_next
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -126,27 +135,26 @@ def start_download():
     ensure_executable()
     query = request.args.get('query', '')
     option = request.args.get('option', '1')
+    page = int(request.args.get('page', 1))
 
     if not query:
         return jsonify({"error": "Falta la búsqueda"}), 400
 
-    # REVISAR SI EL SERVIDOR ESTÁ OCUPADO
     with download_lock:
         if is_downloading:
             return jsonify({
                 "success": False, 
                 "busy": True,
-                "message": f"⚠️ El servidor está procesando otro archivo ('{current_query}'). Por favor, espera 1 o 2 minutos y vuelve a intentarlo para no saturar el sistema."
+                "message": f"⚠️ El servidor está procesando otro archivo ('{current_query}'). Espera 1-2 minutos."
             })
         
-        # Marcar servidor como ocupado
         is_downloading = True
         current_query = query
 
-    task_id = f"{hash(query)}_{option}_{int(time.time())}"
+    task_id = f"{hash(query)}_{option}_p{page}_{int(time.time())}"
     tasks[task_id] = {"status": "downloading"}
 
-    thread = threading.Thread(target=run_download_task, args=(task_id, query, option))
+    thread = threading.Thread(target=run_download_task, args=(task_id, query, option, page))
     thread.start()
 
     return jsonify({"success": True, "task_id": task_id})
@@ -174,9 +182,8 @@ def serve_pack(filename):
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
-                print(f"Archivo eliminado inmediatamente tras la entrega: {file_path}")
-        except Exception as e:
-            print(f"Error borrando archivo post-entrega: {e}")
+        except Exception:
+            pass
         return response
 
     return send_from_directory(PACKS_DIR, filename, as_attachment=True)
