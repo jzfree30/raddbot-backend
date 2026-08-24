@@ -3,6 +3,7 @@ import re
 import time
 import threading
 import subprocess
+import zipfile
 from flask import Flask, request, jsonify, send_from_directory, after_this_request
 from flask_cors import CORS
 
@@ -23,7 +24,7 @@ def clean_ansi(text):
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     return ansi_escape.sub('', text)
 
-def auto_delete_file(file_path, delay=420): # Timer de respaldo: 7 minutos
+def auto_delete_file(file_path, delay=420): # Borrado a los 7 minutos
     time.sleep(delay)
     try:
         if os.path.exists(file_path):
@@ -51,22 +52,42 @@ def run_download_task(task_id, query, option):
         files_after = set(os.listdir(PACKS_DIR))
         new_files = list(files_after - files_before)
 
-        filename = None
-        if new_files:
-            filename = new_files[0]
-        else:
-            all_files = [f for f in os.listdir(PACKS_DIR) if os.path.isfile(os.path.join(PACKS_DIR, f))]
-            if all_files:
-                filename = max(all_files, key=lambda x: os.path.getmtime(os.path.join(PACKS_DIR, x)))
+        # Filtrar solo archivos válidos generados
+        created_files = [f for f in new_files if os.path.isfile(os.path.join(PACKS_DIR, f))]
 
-        if filename:
-            file_path = os.path.join(PACKS_DIR, filename)
-            tasks[task_id] = {"status": "completed", "file": filename}
-            
-            # Si el usuario no descarga el archivo, se borra automáticamente en 7 mins
-            threading.Thread(target=auto_delete_file, args=(file_path, 420), daemon=True).start()
+        if not created_files:
+            tasks[task_id] = {"status": "error", "message": "No se generó ningún archivo."}
+            return
+
+        final_filename = None
+
+        # SI RUSTCOIN DESCARGÓ MÁS DE 1 ARCHIVO -> COMPRIMIR EN UN SOLO ZIP
+        if len(created_files) > 1:
+            clean_name = re.sub(r'[^a-zA-Z0-9_-]', '_', query)
+            zip_filename = f"{clean_name}_completo.zip"
+            zip_path = os.path.join(PACKS_DIR, zip_filename)
+
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_name in created_files:
+                    file_full_path = os.path.join(PACKS_DIR, file_name)
+                    zipf.write(file_full_path, arcname=file_name)
+                    # Eliminar los sueltos para dejar solo el ZIP
+                    try:
+                        os.remove(file_full_path)
+                    except Exception:
+                        pass
+
+            final_filename = zip_filename
         else:
-            tasks[task_id] = {"status": "error", "message": "No se generó el archivo."}
+            # Si solo fue 1 archivo (.mcpack, .mcworld, etc.), dejarlo como está
+            final_filename = created_files[0]
+
+        file_path = os.path.join(PACKS_DIR, final_filename)
+        tasks[task_id] = {"status": "completed", "file": final_filename}
+        
+        # Hilo de borrado por tiempo si no lo descargan
+        threading.Thread(target=auto_delete_file, args=(file_path, 420), daemon=True).start()
+
     except Exception as e:
         tasks[task_id] = {"status": "error", "message": str(e)}
 
@@ -131,7 +152,6 @@ def serve_pack(filename):
 
     @after_this_request
     def remove_file(response):
-        # Borrado inmediato tras ser entregado al navegador del usuario
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
